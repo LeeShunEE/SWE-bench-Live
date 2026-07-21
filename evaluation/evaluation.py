@@ -94,7 +94,48 @@ def apply_solution_patch_best_effort(solution_patch: str,
         container.send_command(r"cd C:\testbed")
     return
 
-def evaluate_instance(  
+
+# Substrings that indicate the OOM killer terminated the test process. Used only
+# to flag a result for review; the reliable signal is exit code 137 (128 + SIGKILL).
+_OOM_LOG_MARKERS = (
+    "Out of memory",
+    "oom-kill",
+    "OOMKilled",
+    "MemoryError",
+    "Killed",
+)
+
+
+def _detect_oom(test_result, post_patch_log: str, container) -> bool:
+    """Best-effort detection that the test run was killed by the OOM killer.
+
+    Signals, in order of reliability:
+      1. test command exit code == 137 (128 + SIGKILL), what Docker's cgroup
+         OOM killer produces when it terminates the process;
+      2. OOM markers in the captured test log;
+      3. the container's OOMKilled state flag (only set when PID 1 is killed).
+    """
+    try:
+        if int(test_result.metadata.exit_code) == 137:
+            return True
+    except (AttributeError, TypeError, ValueError):
+        pass
+    if any(marker in post_patch_log for marker in _OOM_LOG_MARKERS):
+        return True
+    docker_container = getattr(container, "container", None) or getattr(
+        getattr(container, "runtime", None), "container", None
+    )
+    try:
+        if docker_container is not None:
+            docker_container.reload()
+            if docker_container.attrs.get("State", {}).get("OOMKilled"):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def evaluate_instance(
                     instance_id: str,
                     image: str, 
                     rebuild_cmd: str, 
@@ -105,7 +146,7 @@ def evaluate_instance(
                     parser: str,
                     platform: Literal["windows", "linux"],
                     output_dir: str,
-                    ) -> dict[str, Literal['pass', 'fail', 'skip']]:
+                    ) -> tuple[dict[str, Literal['pass', 'fail', 'skip']], bool]:
     container: SetupRuntime = SetupRuntime.from_launch_image(image, instance_id, platform, command_timeout=TIMEOUT)
     container.apply_patch(test_patch)
     container.apply_patch(solution_patch, verbose=True)
@@ -117,10 +158,11 @@ def evaluate_instance(
         container.send_command(f"cat > run_test.sh <<'CC_PROMPT'\n{test_cmd}\nCC_PROMPT\n")
         test_cmd = "bash run_test.sh > testlog.out 2>&1"
         print_cmd = "cat testlog.out"
-    container.send_command(test_cmd)
+    test_result = container.send_command(test_cmd)
     post_patch_log: str = container.send_command(print_cmd).output
     with open(os.path.join(output_dir, "post_patch_log.txt"), "w", encoding="utf-8") as f:
         f.write(post_patch_log)
+    oom_detected: bool = _detect_oom(test_result, post_patch_log, container)
     if parser.lower().strip() == "pytest":
         # for backward compatibility with SWE-bench-Live/SWE-bench-Live (Python)
         post_patch_status: dict[str, Literal['pass', 'fail', 'skip']] = default_pytest_parser(post_patch_log)
@@ -129,7 +171,7 @@ def evaluate_instance(
     container.cleanup()
     with open(os.path.join(output_dir, "status.json"), "w", encoding="utf-8") as f:
         json.dump(post_patch_status, f, indent = True)
-    return post_patch_status
+    return post_patch_status, oom_detected
 
 def run_instance(
                     instance: dict,
@@ -154,7 +196,7 @@ def run_instance(
         print("Incomplete...", instance["instance_id"], flush=True)
         return {"instance_id": instance["instance_id"], "resolved": None}
     os.makedirs(instance_output_dir, exist_ok=True)
-    res: dict[str, Literal['pass', 'fail', 'skip']] = evaluate_instance(
+    res, oom_detected = evaluate_instance(
             instance["instance_id"],
             instance.get("docker_image", get_default_image_name(instance["instance_id"], platform)),
             " ; ".join(instance.get("rebuild_cmds", [])),
@@ -171,6 +213,7 @@ def run_instance(
     report = {
         "instance_id": instance["instance_id"],
         "resolved": False,
+        "oom": oom_detected,
         "PASS_TO_PASS": {
             "success": list(set(suc)&set(instance["PASS_TO_PASS"])),
             "failure": list(set(fail)&set(instance["PASS_TO_PASS"])),
@@ -189,6 +232,9 @@ def run_instance(
         print("Success!", instance["instance_id"], flush=True)
     else:
         print("Failed...", instance["instance_id"], flush=True)
+    if oom_detected:
+        print("WARNING: possible OOM during test run, result may be unreliable:",
+              instance["instance_id"], flush=True)
 
     with open(report_dir, "w", encoding="utf-8") as f:
         json.dump(report, f, indent = True)
