@@ -1,4 +1,4 @@
 [submodule "launch"]
     path = launch
-    url = https://github.com/microsoft/RepoLaunch
-    branch = main
+    url = https://github.com/LeeShunEE/RepoLaunch
+    branch = windows-compat
